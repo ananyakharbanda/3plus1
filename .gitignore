@@ -1,0 +1,19 @@
+# Secrets — NEVER commit these
+setup.sh
+secrets.py
+*.pem
+
+# Logs
+*.log
+*.jsonl
+bot_log.*
+output.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
