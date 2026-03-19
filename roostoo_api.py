@@ -140,8 +140,8 @@ class RoostooClient:
         """
         data = self._get("/v3/balance", signed=True)
         if data and data.get("Success"):
-            print("DEBUG RESPONSE: ", data)
-            return data["SpotWallet"]
+            # API returns either "Wallet" or "SpotWallet" depending on version
+            return data.get("Wallet") or data.get("SpotWallet") or {}
         return None
 
     def place_order(self, pair: str, side: str, quantity: float,
@@ -220,4 +220,3 @@ class RoostooClient:
             if held > 0 and f"{coin}/USD" in tickers:
                 total += held * tickers[f"{coin}/USD"]["LastPrice"]
         return total
-

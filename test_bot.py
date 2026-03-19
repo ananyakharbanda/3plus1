@@ -4,10 +4,13 @@ Roostoo Trading Bot — Main Entry Point
 Runs the structural edge strategy on the Roostoo Mock Exchange.
 
 Usage:
-    export ROOSTOO_API_KEY
-    export ROOSTOO_SECRET_KEY
+    export ROOSTOO_API_KEY="your_key"
+    export ROOSTOO_SECRET_KEY="your_secret"
     python bot.py
 
+Deploy on AWS EC2:
+    nohup python bot.py > output.log 2>&1 &
+    tail -f bot_log.jsonl
 
 Architecture:
     Every 60 seconds, the bot:
@@ -34,50 +37,56 @@ from strategy import Strategy
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════
+
 CONFIG = {
+    # API credentials (set via environment variables)
     "api_key": os.environ.get("ROOSTOO_API_KEY", "YOUR_API_KEY"),
     "secret_key": os.environ.get("ROOSTOO_SECRET_KEY", "YOUR_SECRET_KEY"),
 
+    # Polling interval in seconds (respects API rate limits)
     "poll_interval": 60,
 
+    # Strategy parameters
     "strategy": {
+        # Assets to trade
         "primary_assets": [
             "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD",
             "SOL/USD", "DOGE/USD", "LTC/USD", "LINK/USD",
         ],
-
-        # 🔥 FAST MODE (~1 min warmup)
-        "entropy_window": 5,
+        # Entropy filter
+        "entropy_window": 60,
         "entropy_bins": 10,
-
-        "ll_window": 5,
-        "ll_max_lag": 3,
-        "ll_min_corr": 0.2,
-        "ll_move_threshold": 0.002,
-
-        "ema_fast": 5,
-        "ema_slow": 10,
-        "ema_long": 20,
-
+        # Lead-lag detector
+        "ll_window": 30,
+        "ll_max_lag": 5,
+        "ll_min_corr": 0.3,
+        "ll_move_threshold": 0.005,
+        # Trend EMAs
+        "ema_fast": 20,
+        "ema_slow": 60,
+        "ema_long": 200,
+        # Position sizing
         "target_annual_vol": 0.15,
-        "vol_lookback": 10,
+        "vol_lookback": 48,
         "max_per_asset": 0.30,
         "max_total_exposure": 0.85,
-        "rebalance_threshold": 0.01,
-
+        "rebalance_threshold": 0.03,
+        # Risk management
         "max_drawdown": 0.05,
         "recovery_threshold": 0.03,
-
+        # External signals
         "external": {
             "funding_extreme_high": 0.0005,
             "funding_extreme_low": -0.0003,
-            "min_fetch_interval": 30,
+            "min_fetch_interval": 120,
         },
     },
 
+    # Use limit orders to halve fee costs (0.05% vs 0.1%)
     "use_limit_orders": True,
-    "limit_order_timeout": 25,
+    "limit_order_timeout": 25,  # seconds before cancelling unfilled limits
 
+    # Logging
     "log_file": "bot_log.jsonl",
 }
 
@@ -179,7 +188,6 @@ class Bot:
     def _execute(self, pair: str, side: str, alloc_delta: float,
                  pv: float, wallet: dict, tickers: dict) -> int:
         """Execute a single trade. Returns 1 if successful, 0 if skipped."""
-        print(f"EXECUTING {side} {pair} qty={trade_qty}")
         ticker = tickers.get(pair)
         if not ticker:
             return 0
@@ -253,9 +261,16 @@ class Bot:
 
         # 5. Warmup check
         if not self.strategy.is_ready():
-            n = sum(1 for a in self.strategy._assets.values() if a["_count"] >= 5)
-            self.logger.info(f"Warming up... ({n} assets ready)")
-            return True 
+            btc = self.strategy._assets.get("BTC/USD")
+            btc_count = btc["_count"] if btc else 0
+            btc_need = self.strategy.slow_period
+            n = sum(1 for a in self.strategy._assets.values() if a["_count"] >= 60)
+            mins_left = max(0, btc_need - btc_count)
+            self.logger.info(
+                f"Warming up... BTC: {btc_count}/{btc_need} ticks (~{mins_left} min left) | "
+                f"{n} assets have 60+ ticks | Portfolio: ${portfolio_value:,.0f}"
+            )
+            return True
 
         # 6. Get target allocations
         targets = self.strategy.get_target_allocations(portfolio_value)
@@ -330,4 +345,3 @@ class Bot:
 
 if __name__ == "__main__":
     Bot(CONFIG).run()
-
