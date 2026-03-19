@@ -141,7 +141,7 @@ class RoostooClient:
         data = self._get("/v3/balance", signed=True)
         if data and data.get("Success"):
             print("DEBUG RESPONSE: ", data)
-            return data["Wallet"]
+            return data["SpotWallet"]
         return None
 
     def place_order(self, pair: str, side: str, quantity: float,
