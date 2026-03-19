@@ -140,6 +140,7 @@ class RoostooClient:
         """
         data = self._get("/v3/balance", signed=True)
         if data and data.get("Success"):
+            print("DEBUG RESPONSE: ", data)
             return data["Wallet"]
         return None
 
