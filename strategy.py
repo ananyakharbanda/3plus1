@@ -85,7 +85,7 @@ class EntropyFilter:
         h = self.value
         if h is None:
             return False  # cautious during warmup
-        return h < 2.5  # tunable threshold — calibrate on real data
+        return h < 3.0  # tunable threshold — calibrate on real data
 
     @property
     def trend_confidence(self) -> float:
@@ -423,6 +423,10 @@ class Strategy:
         if total > self.max_total:
             scale = self.max_total / total
             allocations = {p: round(a * scale, 4) for p, a in allocations.items()}
+       
+        # can delete later this is to test only 
+        if not allocations:
+            return {"BTC/USD": 0.1}
 
         return allocations
 
