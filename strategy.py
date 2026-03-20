@@ -35,9 +35,7 @@ from external_signals import ExternalSignals
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════
 # SHANNON ENTROPY REGIME FILTER
-# ══════════════════════════════════════════════════════════════════════
 
 class EntropyFilter:
     """
