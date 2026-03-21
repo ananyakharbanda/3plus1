@@ -4,10 +4,13 @@ Roostoo Trading Bot — Main Entry Point
 Runs the structural edge strategy on the Roostoo Mock Exchange.
 
 Usage:
-    export ROOSTOO_API_KEY
-    export ROOSTOO_SECRET_KEY
+    export ROOSTOO_API_KEY="your_key"
+    export ROOSTOO_SECRET_KEY="your_secret"
     python bot.py
 
+Deploy on AWS EC2:
+    nohup python bot.py > output.log 2>&1 &
+    tail -f bot_log.jsonl
 
 Architecture:
     Every 60 seconds, the bot:
@@ -258,8 +261,15 @@ class Bot:
 
         # 5. Warmup check
         if not self.strategy.is_ready():
+            btc = self.strategy._assets.get("BTC/USD")
+            btc_count = btc["_count"] if btc else 0
+            btc_need = self.strategy.slow_period
             n = sum(1 for a in self.strategy._assets.values() if a["_count"] >= 60)
-            self.logger.info(f"Warming up... ({n} assets ready)")
+            mins_left = max(0, btc_need - btc_count)
+            self.logger.info(
+                f"Warming up... BTC: {btc_count}/{btc_need} ticks (~{mins_left} min left) | "
+                f"{n} assets have 60+ ticks | Portfolio: ${portfolio_value:,.0f}"
+            )
             return True
 
         # 6. Get target allocations
@@ -335,4 +345,3 @@ class Bot:
 
 if __name__ == "__main__":
     Bot(CONFIG).run()
-

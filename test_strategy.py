@@ -23,12 +23,6 @@ Architecture:
     Layer 4: Binance external data — is the crowd about to get liquidated?
     Layer 5: Volatility targeting — how big should the position be?
     Layer 6: Drawdown circuit breaker — are we losing too much?
-
-Entropy calibration (from real Roostoo BTC/USD data, March 2026):
-    Real observed range: 2.23 — 2.90
-    Median: 2.64
-    Threshold: 2.75 (trades 70% of the time, blocks worst 30%)
-    Confidence mapping: [2.3, 2.8] → [1.0, 0.0]
 """
 
 import numpy as np
@@ -41,9 +35,7 @@ from external_signals import ExternalSignals
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════
 # SHANNON ENTROPY REGIME FILTER
-# ══════════════════════════════════════════════════════════════════════
 
 class EntropyFilter:
     """
@@ -55,9 +47,10 @@ class EntropyFilter:
         - Low H = returns concentrated in one direction = TRENDING
         - High H = returns scattered everywhere = RANDOM NOISE
 
-    Calibrated on real Roostoo BTC/USD 1-minute data (March 2026):
-        Observed entropy range: 2.23 — 2.90
-        Threshold 2.75 → trading 70% of the time
+    Why it matters:
+        In a random market, every trend-following trade is a coin flip minus fees.
+        At 0.1% per trade, 10 whipsaw round-trips cost 2% of portfolio.
+        Better to sit in cash and let other teams bleed.
     """
 
     def __init__(self, window: int = 60, n_bins: int = 10):
@@ -88,22 +81,20 @@ class EntropyFilter:
 
     @property
     def is_trending(self) -> bool:
-        """Is the market orderly enough for trend-following?
-        Calibrated: real Roostoo entropy ranges 2.23-2.90.
-        Threshold 2.75 allows trading 70% of the time."""
+        """Is the market orderly enough for trend-following?"""
         h = self.value
         if h is None:
-            return False
-        return h < 2.75
+            return False  # cautious during warmup
+        return h < 3.0  # tunable threshold — calibrate on real data
 
     @property
     def trend_confidence(self) -> float:
-        """How trending is the market? 0 = random, 1 = very orderly.
-        Calibrated: maps real observed range [2.3, 2.8] → [1.0, 0.0]."""
+        """How trending is the market? 0 = random, 1 = very orderly."""
         h = self.value
         if h is None:
             return 0.0
-        return float(np.clip((2.8 - h) / 0.5, 0.0, 1.0))
+        # Map entropy [1.5, 3.2] → confidence [1.0, 0.0]
+        return float(np.clip((3.2 - h) / 1.7, 0.0, 1.0))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -121,12 +112,12 @@ class LeadLagDetector:
     These trades work in ANY market regime, so they bypass the entropy gate.
     """
 
-    def __init__(self, window: int = 30, max_lag: int = 5, min_corr: float = 0.25,
-                 move_threshold: float = 0.003):
+    def __init__(self, window: int = 30, max_lag: int = 5, min_corr: float = 0.3,
+                 move_threshold: float = 0.005):
         self.window = window
         self.max_lag = max_lag
         self.min_corr = min_corr
-        self.move_threshold = move_threshold
+        self.move_threshold = move_threshold  # 0.5% = significant leader move
 
         self.returns: Dict[str, deque] = defaultdict(lambda: deque(maxlen=window + max_lag + 10))
         self.relationships: List[dict] = []
@@ -138,6 +129,7 @@ class LeadLagDetector:
             ret = (price - prev_price) / prev_price
             self.returns[pair].append(ret)
 
+        # Recalculate relationships every 30 ticks
         self._tick_count += 1
         if self._tick_count >= 30:
             self._recalculate()
@@ -161,10 +153,6 @@ class LeadLagDetector:
 
         results.sort(key=lambda x: abs(x["corr"]), reverse=True)
         self.relationships = results[:15]
-
-        if results:
-            top = results[0]
-            logger.info(f"  Lead-lag: {top['leader']}→{top['follower']} lag={top['lag']} corr={top['corr']:.3f}")
 
     def _best_lag(self, leader: str, follower: str) -> Tuple[Optional[int], float]:
         """Find the lag that maximizes leader→follower correlation."""
@@ -200,6 +188,7 @@ class LeadLagDetector:
             if len(leader_rets) < lag + 1:
                 continue
 
+            # Average leader move over the lag period
             leader_move = np.mean(leader_rets[-lag:])
             if abs(leader_move) < self.move_threshold:
                 continue
@@ -233,6 +222,7 @@ class Strategy:
     def __init__(self, config: dict = None):
         cfg = config or {}
 
+        # Which coins to trade (high liquidity, good for lead-lag)
         self.primary_assets = cfg.get("primary_assets", [
             "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD",
             "SOL/USD", "DOGE/USD", "LTC/USD", "LINK/USD",
@@ -246,12 +236,12 @@ class Strategy:
         self.lead_lag = LeadLagDetector(
             window=cfg.get("ll_window", 30),
             max_lag=cfg.get("ll_max_lag", 5),
-            min_corr=cfg.get("ll_min_corr", 0.25),
-            move_threshold=cfg.get("ll_move_threshold", 0.003),
+            min_corr=cfg.get("ll_min_corr", 0.3),
+            move_threshold=cfg.get("ll_move_threshold", 0.005),
         )
         self.external = ExternalSignals(cfg.get("external", {}))
 
-        # EMA periods
+        # EMA periods for trend detection
         self.fast_period = cfg.get("ema_fast", 20)
         self.slow_period = cfg.get("ema_slow", 60)
         self.long_period = cfg.get("ema_long", 200)
@@ -259,9 +249,9 @@ class Strategy:
         # Position sizing
         self.target_vol = cfg.get("target_annual_vol", 0.15)
         self.vol_lookback = cfg.get("vol_lookback", 48)
-        self.max_per_asset = cfg.get("max_per_asset", 0.30)
-        self.max_total = cfg.get("max_total_exposure", 0.85)
-        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.03)
+        self.max_per_asset = cfg.get("max_per_asset", 0.30)       # 30% max in one coin
+        self.max_total = cfg.get("max_total_exposure", 0.85)      # 85% max total invested
+        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.03)  # 3% min change
 
         # Drawdown protection
         self.max_drawdown = cfg.get("max_drawdown", 0.05)
@@ -269,13 +259,16 @@ class Strategy:
         self.peak_value = 0.0
         self.circuit_breaker_active = False
 
-        # Per-asset state
+        # Per-asset state: {pair: {prices, ema_fast, ema_slow, ema_long, returns}}
         self._assets: Dict[str, dict] = {}
 
     # ── Price updates ──────────────────────────────────────────────
 
     def update(self, tickers: Dict[str, dict]):
-        """Feed all current tickers. Call every polling cycle."""
+        """
+        Feed all current tickers. Call every polling cycle.
+        tickers: {pair: {LastPrice, MaxBid, MinAsk, ...}}
+        """
         for pair, data in tickers.items():
             price = data.get("LastPrice", 0)
             if price <= 0:
@@ -306,6 +299,7 @@ class Strategy:
             a["returns"].append((price - prev) / prev)
             self.lead_lag.update(pair, price, prev)
 
+        # Update EMAs incrementally
         for name, period in [("ema_fast", self.fast_period),
                              ("ema_slow", self.slow_period),
                              ("ema_long", self.long_period)]:
@@ -319,6 +313,7 @@ class Strategy:
     # ── Drawdown protection ────────────────────────────────────────
 
     def update_drawdown(self, portfolio_value: float):
+        """Track peak value, activate circuit breaker if drawdown exceeds limit."""
         if portfolio_value > self.peak_value:
             self.peak_value = portfolio_value
         if self.peak_value <= 0:
@@ -336,18 +331,21 @@ class Strategy:
     # ── Signal scoring ─────────────────────────────────────────────
 
     def _is_bullish(self, pair: str) -> bool:
+        """Is the trend bullish? Fast EMA > Slow EMA."""
         a = self._assets.get(pair)
         if not a or not a["ema_fast"] or not a["ema_slow"]:
             return False
         return a["ema_fast"] > a["ema_slow"]
 
     def _is_macro_bullish(self, pair: str) -> bool:
+        """Is price above the long-term EMA?"""
         a = self._assets.get(pair)
         if not a or not a["ema_long"] or not a["prices"]:
             return False
         return a["prices"][-1] > a["ema_long"]
 
     def _trend_strength(self, pair: str) -> float:
+        """How strong is the trend? [0, 1]"""
         a = self._assets.get(pair)
         if not a or not a["ema_fast"] or not a["ema_slow"] or a["ema_slow"] == 0:
             return 0.0
@@ -355,11 +353,12 @@ class Strategy:
         return float(np.clip(diff / 0.02, 0, 1))
 
     def _realized_vol(self, pair: str) -> Optional[float]:
+        """Annualized realized volatility for an asset."""
         a = self._assets.get(pair)
         if not a or len(a["returns"]) < 20:
             return None
         rets = list(a["returns"])[-self.vol_lookback:]
-        return float(np.std(rets) * np.sqrt(525600))
+        return float(np.std(rets) * np.sqrt(525600))  # annualize from 1-min
 
     # ── Main allocation logic ──────────────────────────────────────
 
@@ -368,12 +367,14 @@ class Strategy:
         Decide how much of the portfolio to allocate to each asset.
         Returns {pair: fraction} where fraction in [0, max_per_asset].
 
-        Two paths:
-            Path A: Lead-lag signal → trade regardless of entropy (up to 20%)
-            Path B: Trend following → only when entropy says market is orderly (up to 25%)
+        Logic:
+            1. Circuit breaker → return empty (sell all)
+            2. Lead-lag signals → allocate regardless of entropy
+            3. Trend signals → only if entropy says market is orderly
+            4. Scale by volatility targeting and external risk scalar
         """
         if self.circuit_breaker_active:
-            return {}
+            return {}  # sell everything
 
         allocations = {}
         external_scalar = self.external.get_risk_scalar()
@@ -383,54 +384,59 @@ class Strategy:
         for pair in self.primary_assets:
             a = self._assets.get(pair)
             if not a or a["_count"] < self.slow_period:
-                continue
+                continue  # not enough data yet
 
             alloc = 0.0
 
-            # ── Path A: Lead-lag (bypasses entropy gate) ──
-            if pair in ll_signals and ll_signals[pair] > 0.2:
+            # ── Path A: Lead-lag opportunity (bypasses entropy gate) ──
+            if pair in ll_signals and ll_signals[pair] > 0.3:
                 ll_strength = ll_signals[pair]
-                alloc = 0.20 * ll_strength  # up to 20%
+                alloc = 0.15 * ll_strength  # up to 15% allocation from lead-lag
 
             # ── Path B: Trend following (requires low entropy) ──
             if self.entropy.is_trending and self._is_bullish(pair):
-                trend_alloc = 0.25 * self._trend_strength(pair)  # up to 25%
+                trend_alloc = 0.20 * self._trend_strength(pair)  # up to 20%
                 if self._is_macro_bullish(pair):
-                    trend_alloc *= 1.5  # macro bonus
+                    trend_alloc *= 1.3  # macro alignment bonus
 
-                # Scale by entropy confidence with floor at 0.4
-                trend_alloc *= max(entropy_conf, 0.4)
-                alloc = max(alloc, trend_alloc)
+                trend_alloc *= entropy_conf  # scale by how orderly the market is
+                alloc = max(alloc, trend_alloc)  # take the stronger signal
 
-            if alloc < 0.03:  # below rebalance threshold, skip
+            if alloc < 0.02:  # skip tiny allocations
                 continue
 
-            # ── Vol targeting with floor ──
+            # ── Scale by volatility targeting ──
             vol = self._realized_vol(pair)
             if vol and vol > 0:
                 vol_scalar = self.target_vol / vol
-                alloc *= np.clip(vol_scalar, 0.3, 2.0)  # floor 0.3 so vol doesn't kill allocation
+                alloc *= min(vol_scalar, 2.0)  # cap at 2x
 
-            # ── External signals ──
+            # ── Scale by external signals ──
             alloc *= external_scalar
 
             # ── Cap per asset ──
             alloc = min(alloc, self.max_per_asset)
-            if alloc >= 0.03:
-                allocations[pair] = round(alloc, 4)
+            allocations[pair] = round(alloc, 4)
 
         # ── Cap total exposure ──
         total = sum(allocations.values())
         if total > self.max_total:
             scale = self.max_total / total
             allocations = {p: round(a * scale, 4) for p, a in allocations.items()}
+       
+        # can delete later this is to test only 
+        if not allocations:
+            return {"BTC/USD": 0.1}
 
         return allocations
 
     # ── Limit order pricing ────────────────────────────────────────
 
     def get_limit_price(self, pair: str, side: str, ticker: dict) -> Optional[float]:
-        """Place limit order inside the spread for maker fee (0.05%)."""
+        """
+        Calculate limit order price to qualify as maker (0.05% fee).
+        Places order slightly inside the spread for high fill probability.
+        """
         bid = ticker.get("MaxBid", 0)
         ask = ticker.get("MinAsk", 0)
         if bid <= 0 or ask <= 0:
@@ -438,24 +444,13 @@ class Strategy:
 
         spread = ask - bid
         if side == "BUY":
-            return round(bid + spread * 0.3, 2)
+            return round(bid + spread * 0.3, 2)  # 30% into spread from bid
         else:
-            return round(ask - spread * 0.3, 2)
+            return round(ask - spread * 0.3, 2)  # 30% into spread from ask
 
     # ── Diagnostics ────────────────────────────────────────────────
 
     def get_state(self) -> dict:
-        # Build conviction scores for logging
-        scores = {}
-        for pair in self.primary_assets:
-            a = self._assets.get(pair)
-            if not a or a["_count"] < self.slow_period:
-                continue
-            score = 0.0
-            if self._is_bullish(pair):
-                score = self._trend_strength(pair)
-            scores[pair] = round(score, 3)
-
         return {
             "entropy": round(self.entropy.value, 3) if self.entropy.value else None,
             "entropy_trending": self.entropy.is_trending,
@@ -465,9 +460,10 @@ class Strategy:
             "external": self.external.get_state(),
             "circuit_breaker": self.circuit_breaker_active,
             "assets_ready": sum(1 for a in self._assets.values() if a["_count"] >= self.slow_period),
-            "conviction_scores": scores,
         }
 
     def is_ready(self) -> bool:
+        """Strategy needs at least BTC with enough data."""
         btc = self._assets.get("BTC/USD")
         return btc is not None and btc["_count"] >= self.slow_period and btc["ema_slow"] is not None
+
