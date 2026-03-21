@@ -238,6 +238,13 @@ class Bot:
         dd = (self.strategy.peak_value - pv) / self.strategy.peak_value if self.strategy.peak_value > 0 else 0
         cash_pct = 1 - sum(allocs.values())
 
+        # Warmup: collect data, but still cleanup unwanted coins at profit
+        if not self.strategy.is_ready():
+            self._cleanup_unwanted(pos, tickers, wallet)
+            ct = self.strategy._assets.get("BTC/USD", {}).get("_count", 0) if "BTC/USD" in self.strategy._assets else 0
+            self.L.info(f"Warmup {ct}/{self.strategy.slow_period} | ${pv:,.0f} | From $1M: ${pnl:+,.0f}")
+            return
+
         # Cleanup unwanted coins (NEAR, ONDO, DOT etc) — only at profit
         cleaned = self._cleanup_unwanted(pos, tickers, wallet)
         if cleaned:
