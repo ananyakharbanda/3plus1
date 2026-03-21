@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from roostoo_api import RoostooClient
 from strategy import Strategy
+from telegram_notify import TelegramNotifier
 
 CONFIG = {
     "api_key": os.environ.get("ROOSTOO_API_KEY", "YOUR_API_KEY"),
@@ -68,6 +69,7 @@ class Bot:
         self.pair_info = {}
         self.positions = {}
         self.realized_pnl = 0.0
+        self.tg = TelegramNotifier()
 
     def _state(self, wallet, tickers):
         usd = wallet.get("USD", {}).get("Free", 0) + wallet.get("USD", {}).get("Lock", 0)
@@ -142,6 +144,9 @@ class Bot:
             extra = f" P&L:${trade_pnl:+,.2f}" if trade_pnl is not None else ""
             self.L.info(f"  {side} {qty} {coin} @ ${fpx:,.2f} (${usd_val:,.0f}) [{otype}]{extra}")
             self.dlog.w(f"  TRADE: {side} {qty} {pair} @ ${fpx:,.2f} = ${usd_val:,.2f} [{otype}] {status}{extra}")
+            # Telegram alert
+            avg = self.positions.get(pair, {}).get("avg_price", 0)
+            self.tg.trade_alert(side, qty, pair, fpx, usd_val, otype, trade_pnl, avg)
         else:
             err = result.get("ErrMsg", "?") if result else "fail"
             self.L.warning(f"  FAIL {side} {pair}: {err}")
@@ -217,7 +222,7 @@ class Bot:
         else:
             d.w("  ALL CASH")
 
-        # Execute
+        # Execute — sells first, then buys with remaining cash
         threshold = self.cfg["strategy"]["rebalance_threshold"]
         all_pairs = set(list(targets) + list(allocs))
         sells, buys = {}, {}
@@ -228,8 +233,21 @@ class Bot:
         tc = 0
         for pair, delta in sells.items():
             if self._exec(pair, "SELL", abs(delta), pv, wallet, tickers): tc += 1
-        for pair, delta in buys.items():
-            if self._exec(pair, "BUY", delta, pv, wallet, tickers): tc += 1
+
+        # Refresh wallet after sells so buys see updated cash
+        if sells:
+            fresh_wallet = self.client.balance()
+            if fresh_wallet:
+                wallet = fresh_wallet
+
+        # Buy in order of allocation size (biggest first)
+        for pair, delta in sorted(buys.items(), key=lambda x: x[1], reverse=True):
+            if self._exec(pair, "BUY", delta, pv, wallet, tickers):
+                tc += 1
+                # Deduct spent cash from wallet so next buy sees correct balance
+                spent = abs(delta * pv)
+                usd_free = wallet.get("USD", {}).get("Free", 0)
+                wallet.setdefault("USD", {})["Free"] = max(0, usd_free - spent)
 
         if self.cfg["use_limit_orders"] and tc > 0:
             time.sleep(self.cfg["limit_order_timeout"])
@@ -240,6 +258,9 @@ class Bot:
         self.jlog.j({"e": "tick", "n": self.tick_count, "pv": round(pv, 2), "pnl": round(pnl, 2),
                      "rpnl": round(self.realized_pnl, 2), "dd": round(dd, 4),
                      "tgt": {p: round(float(v), 4) for p, v in targets.items()}, "trades": tc})
+
+        # Telegram hourly update
+        self.tg.hourly_update(pv, pnl, pnl_pct, self.realized_pnl, dd, cash_pct, pos, targets)
 
     def run(self):
         setup_logging()
@@ -258,6 +279,7 @@ class Bot:
             self.initial_value = pv
             self.L.info(f"Starting: ${pv:,.2f}")
         self.dlog.w(f"\n{'#'*70}\nSTARTED {datetime.now()} | ${pv:,.2f}\n{'#'*70}")
+        self.tg.bot_started(pv or 0, len(self.pair_info))
 
         while True:
             try: self.tick()
@@ -265,6 +287,7 @@ class Bot:
             except Exception as e:
                 self.L.error(f"CRASH #{self.tick_count}: {e}")
                 self.dlog.w(f"\nCRASH #{self.tick_count}:\n{traceback.format_exc()}")
+                self.tg.bot_crash(self.tick_count, str(e))
                 time.sleep(10); continue
             time.sleep(self.cfg["poll_interval"])
 

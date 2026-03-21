@@ -1,27 +1,20 @@
 """
-Strategy — FINAL Competition Version
-======================================
-Incorporates ALL observations from live testing + competition optimizations.
+Strategy — Competition Optimized
+==================================
+Fixes from live losses + tuned for aggression.
 
-Live-tested fixes:
-    - Never buy downtrends (LINK bug)
-    - Entropy amplifies trend, never replaces it
-    - Lead-lag uses cumulative returns (was never firing)
-    - Per-coin entropy with normalized bonuses
-    - No vol targeting on 1-min data (was crushing allocations)
-
-Competition optimizations:
-    - Faster EMAs (12/30/100) → 30 min warmup instead of 60
-    - BTC floor: always hold 15% BTC unless strong downtrend
-    - Higher exposure: 90% max, 40% per coin
-    - Lower rebalance threshold: 1.5% (more responsive)
-    - Profit-taking: sell 40% of position when up 3%+
-    - Lead-lag allocation increased to 25%
+Core principles:
+    1. Asymmetric: easy to enter (+0.1%), hard to exit (-0.3%)
+    2. Dynamic hold: 10-tick minimum, but sell allowed on strong reversal
+    3. Gradual scale-down: weak trend → halve position, not dump all
+    4. 7 liquid coins: BTC ETH SOL BNB XRP DOGE LINK
+    5. BTC floor: 10% always (protected unless strong downtrend)
+    6. Profit-taking: trim 40% when up 3%+
 """
 
 import numpy as np
 from collections import deque, defaultdict
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional
 import logging
 
 from external_signals import ExternalSignals
@@ -30,14 +23,12 @@ logger = logging.getLogger(__name__)
 
 
 class CoinEntropy:
-    """Per-coin entropy with self-normalizing bonus."""
-
     def __init__(self, window=40, n_bins=10):
         self.window = window
         self.n_bins = n_bins
         self._returns = defaultdict(lambda: deque(maxlen=window + 10))
         self._cache = {}
-        self._history = defaultdict(lambda: deque(maxlen=30))  # track entropy history per coin
+        self._history = defaultdict(lambda: deque(maxlen=30))
 
     def update(self, pair, ret):
         self._returns[pair].append(ret)
@@ -50,44 +41,24 @@ class CoinEntropy:
             self._cache[pair] = h
             self._history[pair].append(h)
 
-    def get(self, pair) -> Optional[float]:
+    def get(self, pair):
         return self._cache.get(pair)
 
-    def bonus(self, pair) -> float:
-        """
-        Self-normalizing entropy bonus per coin.
-        Compares current entropy to that coin's own recent range.
-        Returns [0.0, 0.6]: 0.6 = very orderly for THIS coin.
-
-        This fixes the problem where LINK (range 1.3-1.5) and BTC (range 2.6-2.8)
-        had completely different scales but were compared with the same threshold.
-        """
+    def bonus(self, pair):
         h = self.get(pair)
         if h is None:
-            return 0.15  # small default during warmup
-
+            return 0.15
         hist = list(self._history.get(pair, []))
         if len(hist) < 5:
-            # Not enough history — use global calibration from live data
             return float(np.clip((2.78 - h) / 0.50 * 0.6, 0.0, 0.6))
-
-        # Normalized: where does current entropy sit in this coin's own range?
-        h_min = min(hist)
-        h_max = max(hist)
-        h_range = h_max - h_min
-
-        if h_range < 0.05:
-            # Very stable entropy — coin is consistently orderly or consistently chaotic
-            # Use absolute scale as fallback
+        h_min, h_max = min(hist), max(hist)
+        if h_max - h_min < 0.05:
             return float(np.clip((2.78 - h) / 0.50 * 0.6, 0.0, 0.6))
-
-        # 0 = at this coin's max entropy (noisiest), 1 = at its min (most orderly)
-        normalized = (h_max - h) / h_range
-        return float(np.clip(normalized * 0.6, 0.0, 0.6))
+        return float(np.clip((h_max - h) / (h_max - h_min) * 0.6, 0.0, 0.6))
 
 
 class LeadLagDetector:
-    def __init__(self, window=30, max_lag=5, min_corr=0.20, move_threshold=0.002):
+    def __init__(self, window=30, max_lag=5, min_corr=0.25, move_threshold=0.002):
         self.window = window
         self.max_lag = max_lag
         self.min_corr = min_corr
@@ -165,33 +136,32 @@ class Strategy:
         cfg = config or {}
 
         self.primary_assets = cfg.get("primary_assets", [
-            "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD",
-            "SOL/USD", "DOGE/USD", "LTC/USD", "LINK/USD",
-            "ONDO/USD", "AVAX/USD", "NEAR/USD", "DOT/USD",
+            "BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD",
+            "XRP/USD", "DOGE/USD", "LINK/USD",
         ])
 
         self.entropy = CoinEntropy(cfg.get("entropy_window", 40), cfg.get("entropy_bins", 10))
         self.lead_lag = LeadLagDetector(
             cfg.get("ll_window", 30), cfg.get("ll_max_lag", 5),
-            cfg.get("ll_min_corr", 0.20), cfg.get("ll_move_threshold", 0.002))
+            cfg.get("ll_min_corr", 0.25), cfg.get("ll_move_threshold", 0.002))
         self.external = ExternalSignals(cfg.get("external", {}))
 
-        # Faster EMAs for 10-day competition (30 min warmup instead of 60)
-        self.fast_period = cfg.get("ema_fast", 12)
-        self.slow_period = cfg.get("ema_slow", 30)
-        self.long_period = cfg.get("ema_long", 100)
+        self.fast_period = cfg.get("ema_fast", 20)
+        self.slow_period = cfg.get("ema_slow", 50)
+        self.long_period = cfg.get("ema_long", 150)
 
-        # Aggressive but controlled
+        self.enter_threshold = cfg.get("enter_threshold", 0.001)
+        self.exit_threshold = cfg.get("exit_threshold", 0.003)
+
         self.max_per_asset = cfg.get("max_per_asset", 0.40)
         self.max_total = cfg.get("max_total_exposure", 0.90)
         self.min_score = cfg.get("min_score", 8)
-        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.015)
-        self.max_coins = cfg.get("max_coins", 4)
+        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.02)
+        self.max_coins = cfg.get("max_coins", 3)
 
-        # BTC floor: always hold some BTC unless downtrending
-        self.btc_floor = cfg.get("btc_floor", 0.15)
+        self.btc_floor = cfg.get("btc_floor", 0.10)
+        self.min_hold_ticks = cfg.get("min_hold_ticks", 10)
 
-        # Profit-taking: sell 40% when position is up 3%+
         self.profit_take_pct = cfg.get("profit_take_pct", 0.03)
         self.profit_take_sell = cfg.get("profit_take_sell", 0.40)
 
@@ -200,8 +170,11 @@ class Strategy:
         self.peak_value = 0.0
         self.circuit_breaker_active = False
         self._assets = {}
+        self._entry_tick = {}
+        self._tick = 0
 
     def update(self, tickers):
+        self._tick += 1
         for pair, data in tickers.items():
             price = data.get("LastPrice", 0)
             if price <= 0:
@@ -240,22 +213,29 @@ class Strategy:
             logger.warning(f"CIRCUIT BREAKER ON: DD={dd:.2%}")
             self.circuit_breaker_active = True
 
-    def _direction(self, pair):
-        a = self._assets.get(pair)
-        if not a or not a["ema_fast"] or not a["ema_slow"] or a["ema_slow"] == 0:
-            return "flat"
-        diff = (a["ema_fast"] - a["ema_slow"]) / a["ema_slow"]
-        if diff > 0.0005:
-            return "up"
-        elif diff < -0.0005:
-            return "down"
-        return "flat"
-
-    def _trend_strength(self, pair):
+    def _ema_diff(self, pair):
         a = self._assets.get(pair)
         if not a or not a["ema_fast"] or not a["ema_slow"] or a["ema_slow"] == 0:
             return 0.0
-        diff = (a["ema_fast"] - a["ema_slow"]) / a["ema_slow"]
+        return (a["ema_fast"] - a["ema_slow"]) / a["ema_slow"]
+
+    def _direction(self, pair, holding=False):
+        diff = self._ema_diff(pair)
+        if holding:
+            if diff > 0:
+                return "up"
+            elif diff < -self.exit_threshold:
+                return "down"   # strong reversal only
+            return "flat"       # small dip → hold
+        else:
+            if diff > self.enter_threshold:
+                return "up"
+            elif diff < -self.enter_threshold:
+                return "down"
+            return "flat"
+
+    def _trend_strength(self, pair):
+        diff = self._ema_diff(pair)
         if diff <= 0:
             return 0.0
         return float(np.clip(diff / 0.012, 0, 1))
@@ -266,36 +246,45 @@ class Strategy:
             return False
         return a["prices"][-1] > a["ema_long"]
 
-    def score_coin(self, pair):
+    def _holding(self, pair, positions):
+        return positions is not None and pair in positions and positions[pair].get("qty", 0) > 0
+
+    def _held_ticks(self, pair):
+        return self._tick - self._entry_tick.get(pair, 0)
+
+    def score_coin(self, pair, positions=None):
         a = self._assets.get(pair)
         if not a or a["_count"] < self.slow_period:
             return {"total": 0, "direction": "?", "trend": 0, "entropy": 0,
-                    "lead_lag": 0, "macro": 0, "ent_raw": 0}
+                    "lead_lag": 0, "macro": 0, "ent_raw": 0, "holding": False}
 
-        direction = self._direction(pair)
+        holding = self._holding(pair, positions)
+        direction = self._direction(pair, holding=holding)
         strength = self._trend_strength(pair)
         ent_bonus = self.entropy.bonus(pair)
-        ll_signals = self.lead_lag.get_bullish_signals()
-        ll_strength = ll_signals.get(pair, 0)
+        ll = self.lead_lag.get_bullish_signals()
+        ll_str = ll.get(pair, 0)
         macro = self._is_macro_bullish(pair)
 
-        # Path A: Trend (REQUIRES uptrend)
         trend_score = 0.0
         ent_score = 0.0
         macro_score = 0.0
+
         if direction == "up":
             trend_score = strength * 45
-            ent_score = ent_bonus * trend_score  # up to 60% bonus
+            ent_score = ent_bonus * trend_score
             macro_score = 15.0 if macro else 0.0
+        elif direction == "flat" and holding:
+            # GRADUAL: don't dump — give half score so position scales down, not exits
+            trend_score = max(strength * 25, 5)  # minimum 5 so it doesn't instantly dump
+            macro_score = 10.0 if macro else 0.0
 
-        # Path B: Lead-lag (independent, up to 45 points)
-        ll_score = ll_strength * 45.0 if ll_strength > 0 else 0.0
+        ll_score = ll_str * 45.0 if ll_str > 0 else 0.0
 
         trend_path = trend_score + ent_score + macro_score
-        ll_path = ll_score
-        total = max(trend_path, ll_path)
-        if trend_path >= 8 and ll_path >= 8:
-            total += 10  # confluence bonus
+        total = max(trend_path, ll_score)
+        if trend_path >= 8 and ll_score >= 8:
+            total += 10
 
         ent_raw = self.entropy.get(pair)
         return {
@@ -306,67 +295,79 @@ class Strategy:
             "lead_lag": round(float(ll_score), 1),
             "macro": round(float(macro_score), 1),
             "ent_raw": round(float(ent_raw), 3) if ent_raw is not None else 0,
+            "holding": holding,
         }
 
-    def get_target_allocations(self, pv, open_positions=None):
-        """
-        Returns target allocations. Also handles:
-        - BTC floor (always 15% unless downtrending)
-        - Profit-taking (reduce positions up 3%+)
-        """
+    def get_target_allocations(self, pv, positions=None):
         if self.circuit_breaker_active:
             return {}
 
-        ext_scalar = self.external.get_risk_scalar()
+        ext = self.external.get_risk_scalar()
 
-        # Score all coins
         scored = {}
-        all_to_check = set(self.primary_assets)
-        for pair in self.lead_lag.get_bullish_signals():
-            if pair in self._assets and self._assets[pair]["_count"] >= self.slow_period:
-                all_to_check.add(pair)
-
-        for pair in all_to_check:
-            s = self.score_coin(pair)
+        for pair in self.primary_assets:
+            s = self.score_coin(pair, positions)
             if s["total"] >= self.min_score:
                 scored[pair] = s
 
-        # Rank and allocate top N
         allocations = {}
         if scored:
             ranked = sorted(scored.items(), key=lambda x: x[1]["total"], reverse=True)[:self.max_coins]
-            total_score = sum(s["total"] for _, s in ranked)
-            if total_score > 0:
+            ts = sum(s["total"] for _, s in ranked)
+            if ts > 0:
                 for pair, s in ranked:
-                    alloc = (s["total"] / total_score) * self.max_total * ext_scalar
+                    alloc = (s["total"] / ts) * self.max_total * ext
                     alloc = min(alloc, self.max_per_asset)
                     if alloc >= self.rebalance_threshold:
                         allocations[pair] = round(float(alloc), 4)
 
-        # BTC floor: always hold 15% BTC unless it's in a downtrend
-        btc_dir = self._direction("BTC/USD")
-        if btc_dir != "down":
-            current_btc = allocations.get("BTC/USD", 0)
-            if current_btc < self.btc_floor:
+        # BTC floor: 10% always unless strong downtrend
+        if self._direction("BTC/USD", holding=True) != "down":
+            if allocations.get("BTC/USD", 0) < self.btc_floor:
                 allocations["BTC/USD"] = self.btc_floor
 
-        # Profit-taking: if any open position is up 3%+, reduce target by 40%
-        if open_positions:
-            for pair, pos in open_positions.items():
-                if pos.get("avg_price", 0) > 0 and pair in self._assets:
-                    current_price = self._assets[pair]["prices"][-1] if self._assets[pair]["prices"] else 0
-                    if current_price > 0:
-                        gain = (current_price / pos["avg_price"]) - 1
-                        if gain >= self.profit_take_pct and pair in allocations:
-                            old = allocations[pair]
-                            allocations[pair] = round(old * (1 - self.profit_take_sell), 4)
-                            logger.info(f"  PROFIT TAKE {pair}: up {gain:.1%}, reducing {old:.1%}→{allocations[pair]:.1%}")
+        # Dynamic hold: 10-tick minimum, but allow sell on strong downtrend
+        if positions:
+            for pair in list(positions.keys()):
+                if positions[pair].get("qty", 0) <= 0:
+                    continue
+                held = self._held_ticks(pair)
+                if held < self.min_hold_ticks and pair not in allocations:
+                    direction = self._direction(pair, holding=True)
+                    if direction == "down":
+                        # Strong reversal → allow sell even within hold period
+                        logger.info(f"  EMERGENCY EXIT {pair}: strong downtrend overrides hold lock ({held} ticks)")
+                    else:
+                        # Not a strong reversal → keep holding
+                        allocations[pair] = round(float(self.max_per_asset * 0.4), 4)
+                        logger.info(f"  HOLD LOCK {pair}: {held}/{self.min_hold_ticks} ticks")
+
+        # Profit-taking
+        if positions:
+            for pair, pos in positions.items():
+                avg = pos.get("avg_price", 0)
+                if avg > 0 and pair in self._assets and self._assets[pair]["prices"]:
+                    cp = self._assets[pair]["prices"][-1]
+                    gain = (cp / avg) - 1
+                    if gain >= self.profit_take_pct and pair in allocations:
+                        old = allocations[pair]
+                        allocations[pair] = round(old * (1 - self.profit_take_sell), 4)
+                        logger.info(f"  PROFIT TAKE {pair}: +{gain:.1%}, {old:.0%}→{allocations[pair]:.0%}")
 
         # Cap total
         total = sum(allocations.values())
         if total > self.max_total:
-            scale = self.max_total / total
-            allocations = {p: round(a * scale, 4) for p, a in allocations.items()}
+            s = self.max_total / total
+            allocations = {p: round(a * s, 4) for p, a in allocations.items()}
+
+        # Track entries
+        if positions:
+            for pair in allocations:
+                if pair not in positions and pair not in self._entry_tick:
+                    self._entry_tick[pair] = self._tick
+            for pair in list(self._entry_tick.keys()):
+                if pair not in allocations and (not positions or pair not in positions):
+                    del self._entry_tick[pair]
 
         return allocations
 
@@ -383,11 +384,6 @@ class Strategy:
             s = self.score_coin(pair)
             if s["total"] > 0:
                 scores[pair] = s
-        for pair in self.lead_lag.get_bullish_signals():
-            if pair not in scores and pair in self._assets:
-                s = self.score_coin(pair)
-                if s["total"] > 0:
-                    scores[pair] = s
         entropies = {}
         for pair in self.primary_assets:
             h = self.entropy.get(pair)
