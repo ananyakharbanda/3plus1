@@ -1,347 +1,272 @@
 """
-Roostoo Trading Bot — Main Entry Point
-========================================
-Runs the structural edge strategy on the Roostoo Mock Exchange.
-
-Usage:
-    export ROOSTOO_API_KEY="your_key"
-    export ROOSTOO_SECRET_KEY="your_secret"
-    python bot.py
-
-Deploy on AWS EC2:
-    nohup python bot.py > output.log 2>&1 &
-    tail -f bot_log.jsonl
-
-Architecture:
-    Every 60 seconds, the bot:
-    1. Fetches all coin prices from Roostoo
-    2. Checks Shannon entropy (is the market orderly or random?)
-    3. Scans for lead-lag opportunities across 8 coins
-    4. Checks Binance funding rate and open interest
-    5. Decides target allocation per coin
-    6. Executes rebalancing trades via limit orders (0.05% fee)
-    7. Logs everything for transparency and review
+Roostoo Bot — FINAL Competition Version
 """
 
-import os
-import sys
-import time
-import json
-import logging
+import os, sys, time, json, logging, traceback
 from datetime import datetime, timezone
 from pathlib import Path
-
 from roostoo_api import RoostooClient
 from strategy import Strategy
 
-# ═══════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
-
 CONFIG = {
-    # API credentials (set via environment variables)
     "api_key": os.environ.get("ROOSTOO_API_KEY", "YOUR_API_KEY"),
     "secret_key": os.environ.get("ROOSTOO_SECRET_KEY", "YOUR_SECRET_KEY"),
-
-    # Polling interval in seconds (respects API rate limits)
     "poll_interval": 60,
-
-    # Strategy parameters
     "strategy": {
-        # Assets to trade
         "primary_assets": [
-            "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD",
-            "SOL/USD", "DOGE/USD", "LTC/USD", "LINK/USD",
+            "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD", "SOL/USD",
+            "DOGE/USD", "LTC/USD", "LINK/USD", "ONDO/USD", "AVAX/USD",
+            "NEAR/USD", "DOT/USD",
         ],
-        # Entropy filter
-        "entropy_window": 60,
-        "entropy_bins": 10,
-        # Lead-lag detector
-        "ll_window": 30,
-        "ll_max_lag": 5,
-        "ll_min_corr": 0.3,
-        "ll_move_threshold": 0.005,
-        # Trend EMAs
-        "ema_fast": 20,
-        "ema_slow": 60,
-        "ema_long": 200,
-        # Position sizing
-        "target_annual_vol": 0.15,
-        "vol_lookback": 48,
-        "max_per_asset": 0.30,
-        "max_total_exposure": 0.85,
-        "rebalance_threshold": 0.03,
-        # Risk management
-        "max_drawdown": 0.05,
-        "recovery_threshold": 0.03,
-        # External signals
-        "external": {
-            "funding_extreme_high": 0.0005,
-            "funding_extreme_low": -0.0003,
-            "min_fetch_interval": 120,
-        },
+        "entropy_window": 40, "entropy_bins": 10,
+        "ll_window": 30, "ll_max_lag": 5, "ll_min_corr": 0.20, "ll_move_threshold": 0.002,
+        "ema_fast": 12, "ema_slow": 30, "ema_long": 100,
+        "max_per_asset": 0.40, "max_total_exposure": 0.90,
+        "min_score": 8, "rebalance_threshold": 0.015, "max_coins": 4,
+        "btc_floor": 0.15, "profit_take_pct": 0.03, "profit_take_sell": 0.40,
+        "max_drawdown": 0.05, "recovery_threshold": 0.03,
+        "external": {"funding_extreme_high": 0.0005, "funding_extreme_low": -0.0003, "min_fetch_interval": 120},
     },
-
-    # Use limit orders to halve fee costs (0.05% vs 0.1%)
     "use_limit_orders": True,
-    "limit_order_timeout": 25,  # seconds before cancelling unfilled limits
-
-    # Logging
+    "limit_order_timeout": 25,
     "log_file": "bot_log.jsonl",
+    "detail_log": "bot_detail.log",
 }
 
-
-# ═══════════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════════
-
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", handlers=[logging.StreamHandler(sys.stdout)])
 
+class FileLog:
+    def __init__(self, p):
+        self.p = Path(p)
+    def j(self, e):
+        e["ts"] = datetime.now(timezone.utc).isoformat()
+        try:
+            with open(self.p, "a") as f: f.write(json.dumps(e, default=str) + "\n")
+        except Exception: pass
 
-class TradeLog:
-    """Append-only JSONL log for every tick and trade."""
-    def __init__(self, path: str):
-        self.path = Path(path)
+class DetailLog:
+    def __init__(self, p):
+        self.p = Path(p)
+    def w(self, t):
+        try:
+            with open(self.p, "a") as f: f.write(t + "\n")
+        except Exception: pass
 
-    def write(self, event: dict):
-        event["timestamp"] = datetime.now(timezone.utc).isoformat()
-        with open(self.path, "a") as f:
-            f.write(json.dumps(event, default=str) + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# BOT
-# ═══════════════════════════════════════════════════════════════════
 
 class Bot:
-    def __init__(self, config: dict):
-        self.cfg = config
-        self.client = RoostooClient(config["api_key"], config["secret_key"])
-        self.strategy = Strategy(config["strategy"])
-        self.log = TradeLog(config["log_file"])
-        self.logger = logging.getLogger("Bot")
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.client = RoostooClient(cfg["api_key"], cfg["secret_key"])
+        self.strategy = Strategy(cfg["strategy"])
+        self.jlog = FileLog(cfg["log_file"])
+        self.dlog = DetailLog(cfg["detail_log"])
+        self.L = logging.getLogger("Bot")
+        self.initial_value = None
+        self.tick_count = 0
+        self.pair_info = {}
+        self.positions = {}
+        self.realized_pnl = 0.0
 
-    # ── Portfolio state ────────────────────────────────────────────
-
-    def get_current_state(self, wallet: dict, tickers: dict) -> tuple[dict, float]:
-        """
-        Calculate current allocations and portfolio value.
-        Returns (allocations_dict, total_value).
-        """
+    def _state(self, wallet, tickers):
         usd = wallet.get("USD", {}).get("Free", 0) + wallet.get("USD", {}).get("Lock", 0)
         total = usd
-        holdings = {}
-
+        allocs, pos = {}, {}
         for coin, bal in wallet.items():
-            if coin == "USD":
-                continue
+            if coin == "USD": continue
             held = bal.get("Free", 0) + bal.get("Lock", 0)
             pair = f"{coin}/USD"
             if held > 0 and pair in tickers:
-                value = held * tickers[pair]["LastPrice"]
-                total += value
-                holdings[pair] = value
+                px = tickers[pair]["LastPrice"]
+                val = held * px
+                total += val
+                avg = self.positions.get(pair, {}).get("avg_price", 0)
+                upnl = (px - avg) * held if avg > 0 else 0
+                pos[pair] = {"qty": held, "price": px, "avg": avg, "value": val, "pnl": upnl}
+        if total > 0:
+            allocs = {p: d["value"] / total for p, d in pos.items()}
+        return allocs, total, pos, usd
 
-        allocs = {pair: val / total for pair, val in holdings.items()} if total > 0 else {}
-        return allocs, total
-
-    # ── Execution ──────────────────────────────────────────────────
-
-    def rebalance(self, targets: dict, current: dict, portfolio_value: float,
-                  wallet: dict, tickers: dict) -> int:
-        """
-        Move from current allocations to target allocations.
-        Sells first (to free USD), then buys.
-        Returns number of trades executed.
-        """
-        threshold = self.cfg["strategy"].get("rebalance_threshold", 0.03)
-        trades = 0
-
-        # Calculate deltas
-        all_pairs = set(list(targets.keys()) + list(current.keys()))
-        sells, buys = {}, {}
-        for pair in all_pairs:
-            delta = targets.get(pair, 0) - current.get(pair, 0)
-            if abs(delta) < threshold:
-                continue
-            if delta < 0:
-                sells[pair] = delta
-            else:
-                buys[pair] = delta
-
-        # Execute sells first
-        for pair, delta in sells.items():
-            trades += self._execute(pair, "SELL", abs(delta), portfolio_value, wallet, tickers)
-
-        # Then buys
-        for pair, delta in buys.items():
-            trades += self._execute(pair, "BUY", delta, portfolio_value, wallet, tickers)
-
-        return trades
-
-    def _execute(self, pair: str, side: str, alloc_delta: float,
-                 pv: float, wallet: dict, tickers: dict) -> int:
-        """Execute a single trade. Returns 1 if successful, 0 if skipped."""
-        ticker = tickers.get(pair)
-        if not ticker:
-            return 0
-
-        price = ticker.get("LastPrice", 0)
-        if price <= 0:
-            return 0
-
+    def _exec(self, pair, side, alloc_delta, pv, wallet, tickers):
+        tk = tickers.get(pair)
+        if not tk: return None
+        px = tk.get("LastPrice", 0)
+        if px <= 0: return None
         coin = pair.split("/")[0]
-        trade_qty = abs(alloc_delta * pv) / price
-
-        # Check available balance
+        qty = abs(alloc_delta * pv) / px
         if side == "BUY":
-            available_usd = wallet.get("USD", {}).get("Free", 0)
-            trade_qty = min(trade_qty, (available_usd * 0.998) / price)
+            avail = wallet.get("USD", {}).get("Free", 0)
+            qty = min(qty, (avail * 0.998) / px)
         else:
-            available_coin = wallet.get(coin, {}).get("Free", 0)
-            trade_qty = min(trade_qty, available_coin)
+            avail = wallet.get(coin, {}).get("Free", 0)
+            qty = min(qty, avail)
+        prec = self.pair_info.get(pair, {}).get("AmountPrecision", 2)
+        min_ord = self.pair_info.get(pair, {}).get("MiniOrder", 1.0)
+        qty = round(qty, prec)
+        if qty <= 0 or qty * px < min_ord: return None
 
-        # Apply precision (6 for BTC, 4 for mid-caps, 2 for others)
-        precision = 6 if coin == "BTC" else (4 if coin in ("ETH", "BNB", "SOL") else 2)
-        trade_qty = round(trade_qty, precision)
-
-        # Minimum order check
-        if trade_qty <= 0 or trade_qty * price < 1.0:
-            return 0
-
-        # Place order
+        result, otype = None, "MARKET"
         if self.cfg["use_limit_orders"]:
-            limit_price = self.strategy.get_limit_price(pair, side, ticker)
-            if limit_price:
-                result = self.client.place_order(pair, side, trade_qty, "LIMIT", limit_price)
-            else:
-                result = self.client.place_order(pair, side, trade_qty, "MARKET")
+            lp = self.strategy.get_limit_price(pair, side, tk)
+            if lp:
+                otype = "LIMIT"
+                result = self.client.place_order(pair, side, qty, "LIMIT", lp)
+        if not result or not result.get("Success"):
+            otype = "MARKET"
+            result = self.client.place_order(pair, side, qty, "MARKET")
+
+        ok = result.get("Success", False) if result else False
+        det = result.get("OrderDetail", {}) if result else {}
+        fpx = det.get("FilledAverPrice", 0) or px
+        status = det.get("Status", "FAIL")
+        usd_val = round(qty * px, 2)
+        trade_pnl = None
+
+        if ok and status in ("FILLED", "PENDING"):
+            if side == "BUY":
+                p = self.positions.get(pair, {"qty": 0, "total_cost": 0, "avg_price": 0})
+                nq = p["qty"] + qty
+                nc = p["total_cost"] + qty * fpx
+                self.positions[pair] = {"qty": nq, "total_cost": nc, "avg_price": nc / nq if nq > 0 else 0}
+            elif side == "SELL" and pair in self.positions:
+                p = self.positions[pair]
+                if p["avg_price"] > 0:
+                    trade_pnl = round((fpx - p["avg_price"]) * qty, 2)
+                    self.realized_pnl += trade_pnl
+                p["qty"] = max(0, p["qty"] - qty)
+                p["total_cost"] = p["qty"] * p["avg_price"]
+                if p["qty"] < 0.000001: del self.positions[pair]
+
+        if ok:
+            extra = f" P&L:${trade_pnl:+,.2f}" if trade_pnl is not None else ""
+            self.L.info(f"  {side} {qty} {coin} @ ${fpx:,.2f} (${usd_val:,.0f}) [{otype}]{extra}")
+            self.dlog.w(f"  TRADE: {side} {qty} {pair} @ ${fpx:,.2f} = ${usd_val:,.2f} [{otype}] {status}{extra}")
         else:
-            result = self.client.place_order(pair, side, trade_qty, "MARKET")
+            err = result.get("ErrMsg", "?") if result else "fail"
+            self.L.warning(f"  FAIL {side} {pair}: {err}")
+        self.jlog.j({"e": "trade", "pair": pair, "side": side, "qty": qty, "px": fpx, "pnl": trade_pnl})
+        return ok
 
-        self.log.write({
-            "event": "trade", "pair": pair, "side": side,
-            "qty": trade_qty, "price": price, "alloc_delta": round(alloc_delta, 4),
-        })
-        return 1
-
-    # ── Main loop ──────────────────────────────────────────────────
-
-    def tick(self) -> bool:
-        """Execute one cycle. Returns True on success."""
-        # 1. Fetch all tickers
+    def tick(self):
+        self.tick_count += 1
         tickers = self.client.all_tickers()
-        if not tickers:
-            self.logger.error("Failed to fetch tickers")
-            return False
-
-        # 2. Feed to strategy
+        if not tickers: return
         self.strategy.update(tickers)
+        try: self.strategy.external.fetch("BTC/USD")
+        except: pass
 
-        # 3. Fetch external signals (rate-limited internally)
-        try:
-            self.strategy.external.fetch("BTC/USD")
-        except Exception:
-            pass  # graceful degradation if Binance unreachable
-
-        # 4. Get portfolio state
         wallet = self.client.balance()
-        if not wallet:
-            self.logger.error("Failed to fetch balance")
-            return False
+        if not wallet: return
 
-        current_allocs, portfolio_value = self.get_current_state(wallet, tickers)
-        self.strategy.update_drawdown(portfolio_value)
+        allocs, pv, pos, usd = self._state(wallet, tickers)
+        self.strategy.update_drawdown(pv)
+        if self.initial_value is None: self.initial_value = pv
+        pnl = pv - self.initial_value
+        pnl_pct = pnl / self.initial_value * 100 if self.initial_value else 0
+        dd = (self.strategy.peak_value - pv) / self.strategy.peak_value if self.strategy.peak_value > 0 else 0
+        cash_pct = 1 - sum(allocs.values())
 
-        # 5. Warmup check
         if not self.strategy.is_ready():
-            btc = self.strategy._assets.get("BTC/USD")
-            btc_count = btc["_count"] if btc else 0
-            btc_need = self.strategy.slow_period
-            n = sum(1 for a in self.strategy._assets.values() if a["_count"] >= 60)
-            mins_left = max(0, btc_need - btc_count)
-            self.logger.info(
-                f"Warming up... BTC: {btc_count}/{btc_need} ticks (~{mins_left} min left) | "
-                f"{n} assets have 60+ ticks | Portfolio: ${portfolio_value:,.0f}"
-            )
-            return True
-
-        # 6. Get target allocations
-        targets = self.strategy.get_target_allocations(portfolio_value)
-        state = self.strategy.get_state()
-
-        cash_pct = 1.0 - sum(current_allocs.values())
-        self.logger.info(
-            f"${portfolio_value:,.0f} | Cash {cash_pct:.0%} | "
-            f"Entropy={state.get('entropy', '?')} ({'TREND' if state.get('entropy_trending') else 'RANDOM'}) | "
-            f"LL signals={len(state.get('lead_lag_signals', {}))} | "
-            f"Targets={targets}"
-        )
-
-        # 7. Execute rebalance
-        trades = self.rebalance(targets, current_allocs, portfolio_value, wallet, tickers)
-
-        # 8. Cancel unfilled limit orders after timeout
-        if self.cfg["use_limit_orders"] and trades > 0:
-            time.sleep(self.cfg["limit_order_timeout"])
-            for pair in targets:
-                self.client.cancel_order(pair=pair)
-
-        # 9. Log state
-        self.log.write({
-            "event": "tick", "portfolio_value": round(portfolio_value, 2),
-            "current": {k: round(v, 4) for k, v in current_allocs.items()},
-            "targets": targets, "trades": trades, "state": state,
-        })
-
-        return True
-
-    def run(self):
-        """Main entry point. Runs forever until interrupted."""
-        setup_logging()
-        self.logger.info("=" * 60)
-        self.logger.info("  ROOSTOO BOT — STRUCTURAL EDGE STRATEGY")
-        self.logger.info(f"  Orders: {'LIMIT (0.05%)' if self.cfg['use_limit_orders'] else 'MARKET (0.1%)'}")
-        self.logger.info(f"  Assets: {self.cfg['strategy']['primary_assets']}")
-        self.logger.info(f"  Poll: {self.cfg['poll_interval']}s")
-        self.logger.info("=" * 60)
-
-        # Verify connection
-        if not self.client.server_time():
-            self.logger.error("Cannot connect to Roostoo API")
+            ct = self.strategy._assets.get("BTC/USD", {}).get("_count", 0)
+            self.L.info(f"Warmup {ct}/{self.strategy.slow_period} | ${pv:,.0f}")
             return
 
-        # Log available pairs
-        pairs = self.client.get_all_pairs()
-        self.logger.info(f"Exchange has {len(pairs)} tradeable pairs")
+        # Pass open positions for profit-taking
+        targets = self.strategy.get_target_allocations(pv, self.positions)
+        state = self.strategy.get_state()
 
-        # Initial portfolio value
+        # Console
+        pos_str = " ".join(f"{p.split('/')[0]}:{allocs.get(p,0):.0%}" for p in pos) if pos else "empty"
+        tgt_str = " ".join(f"{p.split('/')[0]}:{v:.0%}" for p, v in targets.items()) if targets else "CASH"
+        self.L.info(f"#{self.tick_count} ${pv:,.0f} PnL:${pnl:+,.0f}({pnl_pct:+.1f}%) R:${self.realized_pnl:+,.0f} DD:{dd:.1%} Cash:{cash_pct:.0%} [{pos_str}] → [{tgt_str}]")
+
+        # Detail log
+        d = self.dlog
+        now = datetime.now().strftime("%H:%M:%S")
+        d.w(f"\n{'─'*70}")
+        d.w(f"#{self.tick_count} {now} | ${pv:,.2f} | PnL:${pnl:+,.2f} ({pnl_pct:+.3f}%) | R:${self.realized_pnl:+,.2f} | DD:{dd:.3%}")
+        if pos:
+            d.w("POSITIONS:")
+            for pair, info in pos.items():
+                chg = ((info["price"] / info["avg"] - 1) * 100) if info["avg"] > 0 else 0
+                d.w(f"  {pair:<12} {info['qty']:.4f} @ ${info['avg']:>10,.2f} → ${info['price']:>10,.2f} ({chg:+.2f}%) ${info['value']:>10,.2f} unrl:${info['pnl']:+,.2f}")
+        d.w(f"  USD: ${usd:,.2f} ({cash_pct:.1%})")
+
+        ent = state.get("entropies", {})
+        if ent:
+            d.w("ENTROPY:")
+            for pair, h in sorted(ent.items(), key=lambda x: x[1]):
+                d.w(f"  {pair:<12} {h:.3f} bonus:{self.strategy.entropy.bonus(pair):.2f}")
+
+        scores = state.get("coin_scores", {})
+        if scores:
+            d.w(f"SCORES (min {self.strategy.min_score}):")
+            for pair, s in sorted(scores.items(), key=lambda x: x[1]["total"], reverse=True):
+                d.w(f"  {pair:<12} {s['total']:>5.1f}  dir:{s['direction']:>4} T:{s['trend']:>5.1f} E:{s['entropy']:>5.1f} LL:{s['lead_lag']:>5.1f} M:{s['macro']:>5.1f} ent:{s['ent_raw']:.3f}")
+
+        ll = state.get("lead_lag_signals", {})
+        if ll:
+            d.w(f"LEAD-LAG: {', '.join(f'{p}:{v:.2f}' for p,v in ll.items())}")
+
+        d.w("TARGETS:")
+        if targets:
+            for p, a in sorted(targets.items(), key=lambda x: x[1], reverse=True):
+                cur = allocs.get(p, 0)
+                d.w(f"  {p:<12} {a:.1%} (current:{cur:.1%} delta:{a-cur:+.1%})")
+        else:
+            d.w("  ALL CASH")
+
+        # Execute
+        threshold = self.cfg["strategy"]["rebalance_threshold"]
+        all_pairs = set(list(targets) + list(allocs))
+        sells, buys = {}, {}
+        for pair in all_pairs:
+            delta = targets.get(pair, 0) - allocs.get(pair, 0)
+            if abs(delta) >= threshold:
+                (sells if delta < 0 else buys)[pair] = delta
+        tc = 0
+        for pair, delta in sells.items():
+            if self._exec(pair, "SELL", abs(delta), pv, wallet, tickers): tc += 1
+        for pair, delta in buys.items():
+            if self._exec(pair, "BUY", delta, pv, wallet, tickers): tc += 1
+
+        if self.cfg["use_limit_orders"] and tc > 0:
+            time.sleep(self.cfg["limit_order_timeout"])
+            for pair in targets:
+                try: self.client.cancel_order(pair=pair)
+                except: pass
+
+        self.jlog.j({"e": "tick", "n": self.tick_count, "pv": round(pv, 2), "pnl": round(pnl, 2),
+                     "rpnl": round(self.realized_pnl, 2), "dd": round(dd, 4),
+                     "tgt": {p: round(float(v), 4) for p, v in targets.items()}, "trades": tc})
+
+    def run(self):
+        setup_logging()
+        self.L.info("=" * 50)
+        self.L.info("  ROOSTOO BOT — FINAL COMPETITION VERSION")
+        self.L.info(f"  Warmup: ~{self.cfg['strategy']['ema_slow']} min")
+        self.L.info(f"  Detail: {self.cfg['detail_log']}")
+        self.L.info("=" * 50)
+        if not self.client.server_time():
+            self.L.error("Cannot connect"); return
+        self.pair_info = self.client.get_pair_info()
+        self.L.info(f"Loaded {len(self.pair_info)} pairs")
         pv = self.client.get_portfolio_value()
         if pv:
             self.strategy.peak_value = pv
-            self.logger.info(f"Starting portfolio: ${pv:,.2f}")
+            self.initial_value = pv
+            self.L.info(f"Starting: ${pv:,.2f}")
+        self.dlog.w(f"\n{'#'*70}\nSTARTED {datetime.now()} | ${pv:,.2f}\n{'#'*70}")
 
-        # Run
         while True:
-            try:
-                self.tick()
-            except KeyboardInterrupt:
-                self.logger.info("Shutting down")
-                break
+            try: self.tick()
+            except KeyboardInterrupt: self.L.info("Stopped"); break
             except Exception as e:
-                self.logger.exception(f"Error: {e}")
+                self.L.error(f"CRASH #{self.tick_count}: {e}")
+                self.dlog.w(f"\nCRASH #{self.tick_count}:\n{traceback.format_exc()}")
+                time.sleep(10); continue
             time.sleep(self.cfg["poll_interval"])
-
-
-# ═══════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     Bot(CONFIG).run()
