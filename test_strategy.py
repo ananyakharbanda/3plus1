@@ -1,15 +1,15 @@
 """
-Strategy — Competition Optimized
-==================================
-Fixes from live losses + tuned for aggression.
+Strategy — ANTI-CHURN
+======================
+Problem: bot was trading every minute, bleeding $38K in fees.
+Fix: trade RARELY but with CONVICTION.
 
-Core principles:
-    1. Asymmetric: easy to enter (+0.1%), hard to exit (-0.3%)
-    2. Dynamic hold: 10-tick minimum, but sell allowed on strong reversal
-    3. Gradual scale-down: weak trend → halve position, not dump all
-    4. 7 liquid coins: BTC ETH SOL BNB XRP DOGE LINK
-    5. BTC floor: 10% always (protected unless strong downtrend)
-    6. Profit-taking: trim 40% when up 3%+
+Rules:
+    1. Rebalance only when gap > 5% (not 2%)
+    2. Hold positions minimum 30 minutes
+    3. Asymmetric exits: easy in, hard out
+    4. Max 3 coins + BTC floor
+    5. Only trade BTC ETH SOL BNB XRP DOGE LINK
 """
 
 import numpy as np
@@ -151,16 +151,17 @@ class Strategy:
         self.long_period = cfg.get("ema_long", 150)
 
         self.enter_threshold = cfg.get("enter_threshold", 0.001)
-        self.exit_threshold = cfg.get("exit_threshold", 0.003)
+        self.exit_threshold = cfg.get("exit_threshold", 0.004)  # very hard to exit
 
         self.max_per_asset = cfg.get("max_per_asset", 0.40)
         self.max_total = cfg.get("max_total_exposure", 0.90)
         self.min_score = cfg.get("min_score", 8)
-        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.02)
+        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.05)  # 5% — trade rarely
+        self.min_trade_usd = cfg.get("min_trade_usd", 5000)  # no trades under $5K
         self.max_coins = cfg.get("max_coins", 3)
 
         self.btc_floor = cfg.get("btc_floor", 0.10)
-        self.min_hold_ticks = cfg.get("min_hold_ticks", 10)
+        self.min_hold_ticks = cfg.get("min_hold_ticks", 30)  # 30 minutes minimum hold
 
         self.profit_take_pct = cfg.get("profit_take_pct", 0.03)
         self.profit_take_sell = cfg.get("profit_take_sell", 0.40)
@@ -225,8 +226,8 @@ class Strategy:
             if diff > 0:
                 return "up"
             elif diff < -self.exit_threshold:
-                return "down"   # strong reversal only
-            return "flat"       # small dip → hold
+                return "down"
+            return "flat"  # hold through small dips
         else:
             if diff > self.enter_threshold:
                 return "up"
@@ -275,8 +276,7 @@ class Strategy:
             ent_score = ent_bonus * trend_score
             macro_score = 15.0 if macro else 0.0
         elif direction == "flat" and holding:
-            # GRADUAL: don't dump — give half score so position scales down, not exits
-            trend_score = max(strength * 25, 5)  # minimum 5 so it doesn't instantly dump
+            trend_score = max(strength * 25, 5)
             macro_score = 10.0 if macro else 0.0
 
         ll_score = ll_str * 45.0 if ll_str > 0 else 0.0
@@ -318,27 +318,27 @@ class Strategy:
                 for pair, s in ranked:
                     alloc = (s["total"] / ts) * self.max_total * ext
                     alloc = min(alloc, self.max_per_asset)
-                    if alloc >= self.rebalance_threshold:
+                    if alloc >= 0.05:  # minimum 5% allocation to bother
                         allocations[pair] = round(float(alloc), 4)
 
-        # BTC floor: 10% always unless strong downtrend
+        # BTC floor
         if self._direction("BTC/USD", holding=True) != "down":
             if allocations.get("BTC/USD", 0) < self.btc_floor:
                 allocations["BTC/USD"] = self.btc_floor
 
-        # Dynamic hold: 10-tick minimum, but allow sell on strong downtrend
+        # Minimum hold: don't sell within 30 ticks unless strong downtrend
         if positions:
             for pair in list(positions.keys()):
                 if positions[pair].get("qty", 0) <= 0:
                     continue
+                if pair not in self.primary_assets:
+                    continue  # unwanted coins handled separately
                 held = self._held_ticks(pair)
                 if held < self.min_hold_ticks and pair not in allocations:
                     direction = self._direction(pair, holding=True)
                     if direction == "down":
-                        # Strong reversal → allow sell even within hold period
-                        logger.info(f"  EMERGENCY EXIT {pair}: strong downtrend overrides hold lock ({held} ticks)")
+                        logger.info(f"  EMERGENCY EXIT {pair}: strong downtrend overrides hold ({held} ticks)")
                     else:
-                        # Not a strong reversal → keep holding
                         allocations[pair] = round(float(self.max_per_asset * 0.4), 4)
                         logger.info(f"  HOLD LOCK {pair}: {held}/{self.min_hold_ticks} ticks")
 

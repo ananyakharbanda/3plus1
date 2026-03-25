@@ -1,11 +1,8 @@
 """
-Roostoo Bot — FINAL
-====================
-- PnL always calculated from $1,000,000 (competition start)
-- Skip warmup option: if ticks already collected, trade immediately
-- 7 liquid coins: BTC ETH SOL BNB XRP DOGE LINK
-- Smart cleanup: sell unwanted coins only at profit
-- Telegram notifications
+Roostoo Bot — ANTI-CHURN
+==========================
+Fixes the overtrading that bled $38K in fees.
+Key: trade RARELY, hold LONG, no tiny trades.
 """
 
 import os, sys, time, json, logging, traceback
@@ -15,7 +12,7 @@ from roostoo_api import RoostooClient
 from strategy import Strategy
 from telegram_notify import TelegramNotifier
 
-COMPETITION_START_VALUE = 1_000_000.0  # always measure PnL from this
+COMPETITION_START_VALUE = 1_000_000.0
 
 CONFIG = {
     "api_key": os.environ.get("ROOSTOO_API_KEY", "YOUR_API_KEY"),
@@ -30,11 +27,11 @@ CONFIG = {
         "ll_window": 30, "ll_max_lag": 5, "ll_min_corr": 0.25, "ll_move_threshold": 0.002,
         "ema_fast": 20, "ema_slow": 50, "ema_long": 150,
         "max_per_asset": 0.40, "max_total_exposure": 0.90,
-        "min_score": 8, "rebalance_threshold": 0.02, "max_coins": 3,
-        "btc_floor": 0.10, "min_hold_ticks": 10,
+        "min_score": 8, "rebalance_threshold": 0.05, "min_trade_usd": 5000,
+        "max_coins": 3, "btc_floor": 0.10, "min_hold_ticks": 30,
         "profit_take_pct": 0.03, "profit_take_sell": 0.40,
         "max_drawdown": 0.05, "recovery_threshold": 0.03,
-        "enter_threshold": 0.001, "exit_threshold": 0.003,
+        "enter_threshold": 0.001, "exit_threshold": 0.004,
         "external": {"funding_extreme_high": 0.0005, "funding_extreme_low": -0.0003, "min_fetch_interval": 120},
     },
     "use_limit_orders": True,
@@ -44,6 +41,7 @@ CONFIG = {
 }
 
 WANTED_COINS = set(CONFIG["strategy"]["primary_assets"])
+MIN_TRADE_USD = CONFIG["strategy"].get("min_trade_usd", 5000)
 
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -75,7 +73,7 @@ class Bot:
         self.jlog = FileLog(cfg["log_file"])
         self.dlog = DetailLog(cfg["detail_log"])
         self.L = logging.getLogger("Bot")
-        self.initial_value = COMPETITION_START_VALUE  # always $1M
+        self.initial_value = COMPETITION_START_VALUE
         self.tick_count = 0
         self.pair_info = {}
         self.positions = {}
@@ -109,8 +107,15 @@ class Bot:
         px = tk.get("LastPrice", 0)
         if px <= 0:
             return None
+
+        trade_usd = abs(alloc_delta * pv)
+
+        # ANTI-CHURN: skip tiny trades
+        if trade_usd < MIN_TRADE_USD:
+            return None
+
         coin = pair.split("/")[0]
-        qty = abs(alloc_delta * pv) / px
+        qty = trade_usd / px
 
         if side == "BUY":
             avail = wallet.get("USD", {}).get("Free", 0)
@@ -173,7 +178,7 @@ class Bot:
         return ok
 
     def _cleanup_unwanted(self, pos, tickers, wallet):
-        """Sell unwanted coins — ONLY if in profit."""
+        """Sell unwanted coins (NEAR, DOT, ONDO) — ONLY when profitable."""
         sold_any = False
         for pair, info in list(pos.items()):
             if pair in WANTED_COINS:
@@ -208,8 +213,7 @@ class Bot:
                                 del self.positions[pair]
                             sold_any = True
             else:
-                self.L.info(f"  HOLDING {coin}: unwanted but at {pnl_pct:.2f}% loss — waiting")
-                self.dlog.w(f"  UNWANTED HOLD: {pair} at {pnl_pct:.2f}% — waiting for breakeven")
+                self.L.info(f"  HOLDING {coin}: unwanted, {pnl_pct:.2f}% loss — waiting")
 
         return sold_any
 
@@ -218,7 +222,6 @@ class Bot:
         tickers = self.client.all_tickers()
         if not tickers:
             return
-
         self.strategy.update(tickers)
         try:
             self.strategy.external.fetch("BTC/USD")
@@ -232,20 +235,19 @@ class Bot:
         allocs, pv, pos, usd = self._state(wallet, tickers)
         self.strategy.update_drawdown(pv)
 
-        # PnL always from $1,000,000
         pnl = pv - COMPETITION_START_VALUE
         pnl_pct = pnl / COMPETITION_START_VALUE * 100
         dd = (self.strategy.peak_value - pv) / self.strategy.peak_value if self.strategy.peak_value > 0 else 0
         cash_pct = 1 - sum(allocs.values())
 
-        # Warmup: collect data, but still cleanup unwanted coins at profit
+        # Warmup: collect data but still cleanup unwanted coins
         if not self.strategy.is_ready():
             self._cleanup_unwanted(pos, tickers, wallet)
             ct = self.strategy._assets.get("BTC/USD", {}).get("_count", 0) if "BTC/USD" in self.strategy._assets else 0
             self.L.info(f"Warmup {ct}/{self.strategy.slow_period} | ${pv:,.0f} | From $1M: ${pnl:+,.0f}")
             return
 
-        # Cleanup unwanted coins (NEAR, ONDO, DOT etc) — only at profit
+        # Cleanup unwanted
         cleaned = self._cleanup_unwanted(pos, tickers, wallet)
         if cleaned:
             wallet = self.client.balance()
@@ -275,7 +277,7 @@ class Bot:
             d.w("POSITIONS:")
             for pair, info in pos.items():
                 chg = ((info["price"] / info["avg"] - 1) * 100) if info["avg"] > 0 else 0
-                tag = "✓" if pair in WANTED_COINS else "✗ UNWANTED"
+                tag = "✓" if pair in WANTED_COINS else "✗"
                 d.w(f"  {pair:<12} {info['qty']:.4f} @ ${info['avg']:>10,.2f} → ${info['price']:>10,.2f} ({chg:+.2f}%) ${info['value']:>10,.2f} unrl:${info['pnl']:+,.2f} {tag}")
         d.w(f"  USD: ${usd:,.2f} ({cash_pct:.1%})")
 
@@ -303,7 +305,7 @@ class Bot:
         else:
             d.w("  ALL CASH")
 
-        # Execute
+        # Execute — sells first, then buys
         threshold = self.cfg["strategy"]["rebalance_threshold"]
         all_pairs = set(list(targets) + [p for p in allocs if p in WANTED_COINS])
         sells, buys = {}, {}
@@ -338,19 +340,19 @@ class Bot:
                     pass
 
         self.jlog.j({"e": "tick", "n": self.tick_count, "pv": round(pv, 2),
-                     "pnl_from_1m": round(pnl, 2), "pnl_pct": round(pnl_pct, 4),
-                     "rpnl": round(self.realized_pnl, 2), "dd": round(dd, 4),
-                     "tgt": {p: round(float(v), 4) for p, v in targets.items()}, "trades": tc})
+                     "pnl_from_1m": round(pnl, 2), "rpnl": round(self.realized_pnl, 2),
+                     "dd": round(dd, 4), "tgt": {p: round(float(v), 4) for p, v in targets.items()}, "trades": tc})
 
-        # Telegram hourly update
         self.tg.hourly_update(pv, pnl, pnl_pct, self.realized_pnl, dd, cash_pct, pos, targets)
 
     def run(self):
         setup_logging()
         self.L.info("=" * 50)
-        self.L.info("  ROOSTOO BOT — FINAL")
+        self.L.info("  ROOSTOO BOT — ANTI-CHURN")
         self.L.info(f"  Coins: {CONFIG['strategy']['primary_assets']}")
-        self.L.info(f"  EMAs: {CONFIG['strategy']['ema_fast']}/{CONFIG['strategy']['ema_slow']}/{CONFIG['strategy']['ema_long']}")
+        self.L.info(f"  Min trade: ${MIN_TRADE_USD:,}")
+        self.L.info(f"  Rebalance threshold: {CONFIG['strategy']['rebalance_threshold']:.0%}")
+        self.L.info(f"  Min hold: {CONFIG['strategy']['min_hold_ticks']} ticks")
         self.L.info(f"  PnL baseline: $1,000,000")
         self.L.info("=" * 50)
         if not self.client.server_time():
@@ -362,7 +364,7 @@ class Bot:
         if pv:
             self.strategy.peak_value = pv
             self.L.info(f"Current: ${pv:,.2f} | From $1M: ${pv - COMPETITION_START_VALUE:+,.2f}")
-        self.dlog.w(f"\n{'#'*70}\nSTARTED {datetime.now()} | ${pv:,.2f} | From $1M: ${pv - COMPETITION_START_VALUE:+,.2f}\n{'#'*70}")
+        self.dlog.w(f"\n{'#'*70}\nSTARTED {datetime.now()} | ${pv:,.2f}\n{'#'*70}")
         self.tg.bot_started(pv or 0, len(self.pair_info))
 
         while True:

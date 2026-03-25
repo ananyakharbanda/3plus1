@@ -1,15 +1,22 @@
 """
-Strategy — ANTI-CHURN
-======================
-Problem: bot was trading every minute, bleeding $38K in fees.
-Fix: trade RARELY but with CONVICTION.
+Strategy — DATA-DRIVEN FINAL
+==============================
+Built from analyzing 391 real trades and $60K in losses.
 
-Rules:
-    1. Rebalance only when gap > 5% (not 2%)
-    2. Hold positions minimum 30 minutes
-    3. Asymmetric exits: easy in, hard out
-    4. Max 3 coins + BTC floor
-    5. Only trade BTC ETH SOL BNB XRP DOGE LINK
+Root causes of losses:
+    1. $20K burned in fees (391 trades, 157 tiny DOGE buys)
+    2. $40K from buying into a falling market (BTC -3.8% over 3 days)
+    3. Position data lost on restarts → cleanup couldn't work
+
+Fixes:
+    1. BTC REGIME FILTER — if BTC is falling, NO NEW BUYS for any coin
+       Crypto is correlated. If BTC drops, everything drops.
+       Go to cash and wait.
+    2. Minimum trade $20K (not $5K) — eliminates tiny DOGE buys
+    3. Rebalance threshold 8% — trade very rarely
+    4. Min hold 60 ticks (1 hour) — stop churning
+    5. Exit threshold 0.5% — very hard to flip out of a position
+    6. When BTC recovers → deploy aggressively into top 2 coins
 """
 
 import numpy as np
@@ -28,7 +35,7 @@ class CoinEntropy:
         self.n_bins = n_bins
         self._returns = defaultdict(lambda: deque(maxlen=window + 10))
         self._cache = {}
-        self._history = defaultdict(lambda: deque(maxlen=30))
+        self._history = defaultdict(lambda: deque(maxlen=100))
 
     def update(self, pair, ret):
         self._returns[pair].append(ret)
@@ -49,12 +56,10 @@ class CoinEntropy:
         if h is None:
             return 0.15
         hist = list(self._history.get(pair, []))
-        if len(hist) < 5:
+        if len(hist) < 10:
             return float(np.clip((2.78 - h) / 0.50 * 0.6, 0.0, 0.6))
-        h_min, h_max = min(hist), max(hist)
-        if h_max - h_min < 0.05:
-            return float(np.clip((2.78 - h) / 0.50 * 0.6, 0.0, 0.6))
-        return float(np.clip((h_max - h) / (h_max - h_min) * 0.6, 0.0, 0.6))
+        percentile = np.sum(np.array(hist) <= h) / len(hist)
+        return float(np.clip((1.0 - percentile) * 0.6, 0.0, 0.6))
 
 
 class LeadLagDetector:
@@ -67,6 +72,7 @@ class LeadLagDetector:
         self.prices = defaultdict(lambda: deque(maxlen=max_lag + 5))
         self.relationships = []
         self._tick = 0
+        self._signal_age = defaultdict(int)
 
     def update(self, pair, price, ret):
         self.returns[pair].append(ret)
@@ -128,7 +134,14 @@ class LeadLagDetector:
             signal = float(np.clip(signal, 0, 1.0))
             if follower not in signals or signal > signals[follower]:
                 signals[follower] = signal
+        new_ages = {}
+        for pair, sig in signals.items():
+            new_ages[pair] = self._signal_age.get(pair, 0) + 1
+        self._signal_age = new_ages
         return signals
+
+    def get_signal_age(self, pair):
+        return self._signal_age.get(pair, 0)
 
 
 class Strategy:
@@ -151,23 +164,24 @@ class Strategy:
         self.long_period = cfg.get("ema_long", 150)
 
         self.enter_threshold = cfg.get("enter_threshold", 0.001)
-        self.exit_threshold = cfg.get("exit_threshold", 0.004)  # very hard to exit
+        self.exit_threshold = cfg.get("exit_threshold", 0.005)  # very hard to exit
 
-        self.max_per_asset = cfg.get("max_per_asset", 0.40)
+        self.max_per_asset = cfg.get("max_per_asset", 0.45)
         self.max_total = cfg.get("max_total_exposure", 0.90)
-        self.min_score = cfg.get("min_score", 8)
-        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.05)  # 5% — trade rarely
-        self.min_trade_usd = cfg.get("min_trade_usd", 5000)  # no trades under $5K
-        self.max_coins = cfg.get("max_coins", 3)
+        self.min_score = cfg.get("min_score", 10)
+        self.rebalance_threshold = cfg.get("rebalance_threshold", 0.08)  # 8% — trade very rarely
+        self.min_trade_usd = cfg.get("min_trade_usd", 20000)  # no trades under $20K
+        self.max_coins = cfg.get("max_coins", 2)  # max 2 coins — concentrated bets
 
-        self.btc_floor = cfg.get("btc_floor", 0.10)
-        self.min_hold_ticks = cfg.get("min_hold_ticks", 30)  # 30 minutes minimum hold
+        self.btc_floor = cfg.get("btc_floor", 0.0)  # NO BTC FLOOR — if market is down, go full cash
+
+        self.min_hold_ticks = cfg.get("min_hold_ticks", 60)  # 1 hour minimum hold
 
         self.profit_take_pct = cfg.get("profit_take_pct", 0.03)
         self.profit_take_sell = cfg.get("profit_take_sell", 0.40)
 
-        self.max_drawdown = cfg.get("max_drawdown", 0.05)
-        self.recovery_threshold = cfg.get("recovery_threshold", 0.03)
+        self.max_drawdown = cfg.get("max_drawdown", 0.08)  # wider DD tolerance — don't panic sell
+        self.recovery_threshold = cfg.get("recovery_threshold", 0.04)
         self.peak_value = 0.0
         self.circuit_breaker_active = False
         self._assets = {}
@@ -220,6 +234,22 @@ class Strategy:
             return 0.0
         return (a["ema_fast"] - a["ema_slow"]) / a["ema_slow"]
 
+    def _btc_regime(self):
+        """
+        THE MOST IMPORTANT FUNCTION.
+        If BTC is falling → entire market is falling → NO NEW BUYS.
+        Returns 'bull', 'bear', or 'neutral'.
+        """
+        btc = self._assets.get("BTC/USD")
+        if not btc or not btc["ema_fast"] or not btc["ema_slow"]:
+            return "neutral"
+        diff = (btc["ema_fast"] - btc["ema_slow"]) / btc["ema_slow"]
+        if diff > 0.001:
+            return "bull"
+        elif diff < -0.001:
+            return "bear"
+        return "neutral"
+
     def _direction(self, pair, holding=False):
         diff = self._ema_diff(pair)
         if holding:
@@ -227,7 +257,7 @@ class Strategy:
                 return "up"
             elif diff < -self.exit_threshold:
                 return "down"
-            return "flat"  # hold through small dips
+            return "flat"
         else:
             if diff > self.enter_threshold:
                 return "up"
@@ -265,6 +295,7 @@ class Strategy:
         ent_bonus = self.entropy.bonus(pair)
         ll = self.lead_lag.get_bullish_signals()
         ll_str = ll.get(pair, 0)
+        ll_age = self.lead_lag.get_signal_age(pair)
         macro = self._is_macro_bullish(pair)
 
         trend_score = 0.0
@@ -279,7 +310,12 @@ class Strategy:
             trend_score = max(strength * 25, 5)
             macro_score = 10.0 if macro else 0.0
 
-        ll_score = ll_str * 45.0 if ll_str > 0 else 0.0
+        ll_score = 0.0
+        if ll_str > 0:
+            ll_base = ll_str * 45.0
+            if ll_age <= 10:
+                ll_base *= 2.0
+            ll_score = min(ll_base, 90.0)
 
         trend_path = trend_score + ent_score + macro_score
         total = max(trend_path, ll_score)
@@ -298,10 +334,11 @@ class Strategy:
             "holding": holding,
         }
 
-    def get_target_allocations(self, pv, positions=None):
+    def get_target_allocations(self, pv, positions=None, just_freed_cash=False):
         if self.circuit_breaker_active:
             return {}
 
+        regime = self._btc_regime()
         ext = self.external.get_risk_scalar()
 
         scored = {}
@@ -311,6 +348,39 @@ class Strategy:
                 scored[pair] = s
 
         allocations = {}
+
+        if regime == "bear" and not just_freed_cash:
+            # BEAR: hold existing, no new buys
+            logger.info(f"  BTC REGIME: BEAR — no new buys")
+            if positions:
+                for pair in positions:
+                    if positions[pair].get("qty", 0) > 0 and pair in self.primary_assets:
+                        direction = self._direction(pair, holding=True)
+                        if direction != "down":
+                            allocations[pair] = round(float(self.max_per_asset * 0.3), 4)
+            return allocations
+
+        if regime == "bear" and just_freed_cash:
+            # BEAR but just freed cash from cleanup
+            # Only buy something with genuine relative strength (score >= 20)
+            logger.info(f"  BTC REGIME: BEAR but cash freed — looking for relative strength")
+            strong = {p: s for p, s in scored.items() if s["direction"] == "up" and s["total"] >= 20}
+            if strong:
+                best_pair, best_score = max(strong.items(), key=lambda x: x[1]["total"])
+                allocations[best_pair] = round(float(self.max_per_asset), 4)
+                logger.info(f"  REINVEST: {best_pair} score={best_score['total']} — strongest in weak market")
+            else:
+                logger.info(f"  No strong coins found — cash stays as cash")
+            # Keep existing holdings too
+            if positions:
+                for pair in positions:
+                    if positions[pair].get("qty", 0) > 0 and pair in self.primary_assets and pair not in allocations:
+                        direction = self._direction(pair, holding=True)
+                        if direction != "down":
+                            allocations[pair] = round(float(self.max_per_asset * 0.3), 4)
+            return allocations
+
+        # BULL or NEUTRAL: normal scoring
         if scored:
             ranked = sorted(scored.items(), key=lambda x: x[1]["total"], reverse=True)[:self.max_coins]
             ts = sum(s["total"] for _, s in ranked)
@@ -318,28 +388,23 @@ class Strategy:
                 for pair, s in ranked:
                     alloc = (s["total"] / ts) * self.max_total * ext
                     alloc = min(alloc, self.max_per_asset)
-                    if alloc >= 0.05:  # minimum 5% allocation to bother
+                    if alloc >= 0.08:
                         allocations[pair] = round(float(alloc), 4)
 
-        # BTC floor
-        if self._direction("BTC/USD", holding=True) != "down":
-            if allocations.get("BTC/USD", 0) < self.btc_floor:
-                allocations["BTC/USD"] = self.btc_floor
-
-        # Minimum hold: don't sell within 30 ticks unless strong downtrend
+        # Min hold: 60 ticks
         if positions:
             for pair in list(positions.keys()):
                 if positions[pair].get("qty", 0) <= 0:
                     continue
                 if pair not in self.primary_assets:
-                    continue  # unwanted coins handled separately
+                    continue
                 held = self._held_ticks(pair)
                 if held < self.min_hold_ticks and pair not in allocations:
                     direction = self._direction(pair, holding=True)
                     if direction == "down":
-                        logger.info(f"  EMERGENCY EXIT {pair}: strong downtrend overrides hold ({held} ticks)")
+                        logger.info(f"  EMERGENCY EXIT {pair}: strong reversal ({held} ticks)")
                     else:
-                        allocations[pair] = round(float(self.max_per_asset * 0.4), 4)
+                        allocations[pair] = round(float(self.max_per_asset * 0.3), 4)
                         logger.info(f"  HOLD LOCK {pair}: {held}/{self.min_hold_ticks} ticks")
 
         # Profit-taking
@@ -352,9 +417,9 @@ class Strategy:
                     if gain >= self.profit_take_pct and pair in allocations:
                         old = allocations[pair]
                         allocations[pair] = round(old * (1 - self.profit_take_sell), 4)
-                        logger.info(f"  PROFIT TAKE {pair}: +{gain:.1%}, {old:.0%}→{allocations[pair]:.0%}")
+                        logger.info(f"  PROFIT TAKE {pair}: +{gain:.1%}")
 
-        # Cap total
+        # Cap
         total = sum(allocations.values())
         if total > self.max_total:
             s = self.max_total / total
@@ -391,6 +456,7 @@ class Strategy:
                 entropies[pair] = round(h, 3)
         return {
             "coin_scores": scores, "entropies": entropies,
+            "btc_regime": self._btc_regime(),
             "lead_lag_pairs": len(self.lead_lag.relationships),
             "lead_lag_signals": self.lead_lag.get_bullish_signals(),
             "external": self.external.get_state(),
