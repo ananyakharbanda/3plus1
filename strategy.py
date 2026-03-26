@@ -280,6 +280,12 @@ class Strategy:
     def _holding(self, pair, positions):
         return positions is not None and pair in positions and positions[pair].get("qty", 0) > 0
 
+    def _current_price(self, pair):
+        a = self._assets.get(pair)
+        if a and a["prices"]:
+            return a["prices"][-1]
+        return 0
+
     def _held_ticks(self, pair):
         return self._tick - self._entry_tick.get(pair, 0)
 
@@ -401,8 +407,17 @@ class Strategy:
                 held = self._held_ticks(pair)
                 if held < self.min_hold_ticks and pair not in allocations:
                     direction = self._direction(pair, holding=True)
-                    if direction == "down":
-                        logger.info(f"  EMERGENCY EXIT {pair}: strong reversal ({held} ticks)")
+                    avg = positions[pair].get("avg_price", 0)
+                    cp = self._current_price(pair)
+                    at_profit = (cp >= avg) if avg > 0 and cp > 0 else False
+
+                    if direction == "down" and at_profit:
+                        logger.info(f"  EMERGENCY EXIT {pair}: strong reversal + at profit ({held} ticks)")
+                    elif direction == "down" and not at_profit:
+                        # Strong downtrend but at a loss — hold anyway, don't crystallize loss
+                        allocations[pair] = round(float(self.max_per_asset * 0.3), 4)
+                        loss_pct = ((cp / avg - 1) * 100) if avg > 0 else 0
+                        logger.info(f"  HOLD THROUGH DIP {pair}: downtrend but at {loss_pct:.1f}% loss — not selling")
                     else:
                         allocations[pair] = round(float(self.max_per_asset * 0.3), 4)
                         logger.info(f"  HOLD LOCK {pair}: {held}/{self.min_hold_ticks} ticks")
@@ -418,6 +433,33 @@ class Strategy:
                         old = allocations[pair]
                         allocations[pair] = round(old * (1 - self.profit_take_sell), 4)
                         logger.info(f"  PROFIT TAKE {pair}: +{gain:.1%}")
+
+        # ═══════════════════════════════════════════════════════
+        # LOSS PROTECTION: never sell at a loss
+        # If we hold a coin and it's not in targets (would be sold),
+        # check if it's at a loss. If yes, force-keep it.
+        # Only allow sells when position is at profit or breakeven.
+        # ═══════════════════════════════════════════════════════
+        if positions:
+            for pair, pos_data in positions.items():
+                if pos_data.get("qty", 0) <= 0:
+                    continue
+                avg = pos_data.get("avg_price", 0)
+                if avg <= 0:
+                    continue
+
+                # Check if this position would be reduced or sold
+                current_alloc_approx = (pos_data["qty"] * self._current_price(pair)) / pv if pv > 0 else 0
+                target_alloc = allocations.get(pair, 0)
+
+                if target_alloc < current_alloc_approx - 0.02:
+                    # Strategy wants to reduce/sell this position
+                    cp = self._current_price(pair)
+                    if cp > 0 and cp < avg:
+                        # AT A LOSS — do not sell, keep at current size
+                        loss_pct = (cp / avg - 1) * 100
+                        allocations[pair] = round(float(current_alloc_approx), 4)
+                        logger.info(f"  LOSS PROTECT {pair}: at {loss_pct:.2f}% loss — holding, not selling")
 
         # Cap
         total = sum(allocations.values())
